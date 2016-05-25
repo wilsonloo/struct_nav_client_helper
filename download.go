@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,42 +13,80 @@ import (
 	"strings"
 )
 
-func main() {
+/*
+	请求下载
+	@param remote_url 下载的资源
+	@param save_filename 保存的文件
+*/
+func DownLoad(remote_url string, save_filename string) error {
 
 	//设置cpu的核的数量，从而实现高并发
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	// 创建下载会话
 	var session DownloadSession
-	session.remote_url = "http://i2.itc.cn/20160525/a75_a6767725_9b6c_8f25_a496_b9a02cb7c8bc_9.jpg"
-	session.save_filename = "d:\\55.jpg"
+	session.remote_url = remote_url
+	session.save_filename = save_filename
 
 	err := init_session(&session)
 	if err != nil {
 		fmt.Println(err.Error())
-		return
+		return err
 	}
+	defer func() {
+		if session.save_file != nil {
+			session.save_file.Close()
+			session.save_file = nil
+		}
 
-	fmt.Println("************************", len(session.tdg_info.SegmemtsDownloaded))
+		if session.tdg_file != nil {
+			session.tdg_file.Close()
+			session.tdg_file = nil
+		}
+	}()
+
 	// 开启协程组进行分段下载
 	for segment_idx := 0; segment_idx*int(session.tdg_info.FileSegmentSize) < int(session.tdg_info.TotalSize); segment_idx++ {
-		session.wait_group.Add(1)
+		// 检测是否已经下载
+		if !session.tdg_info.IsSegmentDownloaded(segment_idx) {
+			session.wait_group.Add(1)
 
-		go getShangTickerTables(&session, segment_idx)
+			go getShangTickerTables(&session, segment_idx)
+		}
 	}
 
 	// 等待下载完成
 	session.wait_group.Wait()
 
-	fmt.Println("main ok")
+	fmt.Println("download complete.")
+	// fmt.Println(session.tdg_info)
+
+	return nil
 }
 
-func init_session(session *DownloadSession) error {
+func init_session(session *DownloadSession) (err error) {
+	defer func() {
+		if err != nil {
+
+			err = errors.New("init_session() error : " + err.Error())
+
+			if session.save_file != nil {
+				session.save_file.Close()
+				session.save_file = nil
+			}
+
+			if session.tdg_file != nil {
+				session.tdg_file.Close()
+				session.tdg_file = nil
+			}
+		}
+	}()
+
 	// 获取远程文件信息
 	remote_file_info := get_remote_res_info(session.remote_url)
 
 	// 检测下载文件的状态
-	err := check_save_file(session, remote_file_info.FileTotalSize, MAX_FILE_SEGMENT_BYTES_PER_ROUTINE)
+	err = check_save_file(session, remote_file_info.FileTotalSize, MAX_FILE_SEGMENT_BYTES_PER_ROUTINE)
 	if err != nil {
 		return err
 	}
@@ -58,7 +97,6 @@ func init_session(session *DownloadSession) error {
 		fmt.Println(err.Error())
 		panic(err)
 	}
-	defer save_file.Close()
 
 	// 实际存储文件的摘要信息
 	tdg_file, err := os.OpenFile(session.save_filename+".tdg", os.O_RDWR, os.FileMode(0666))
@@ -66,7 +104,6 @@ func init_session(session *DownloadSession) error {
 		fmt.Println(err.Error())
 		panic(err)
 	}
-	defer tdg_file.Close()
 
 	session.save_file = save_file
 	session.tdg_file = tdg_file
@@ -74,7 +111,7 @@ func init_session(session *DownloadSession) error {
 	// 读取 tdg 信息
 	err = read_tdg_info(session)
 	if err != nil {
-		return err
+		return errors.New("read_tdg_info failed:" + err.Error())
 	}
 
 	return nil
@@ -82,14 +119,9 @@ func init_session(session *DownloadSession) error {
 
 func check_save_file(session *DownloadSession, file_total_size int, file_segment_size int) error {
 
-	// 检测本地现在文件状态
+	// 检测本地现在文件状态, 判断不存在则创建
 	_, err := os.Stat(session.save_filename)
-	if err != nil {
-		return err
-	}
-
-	// 不存在则创建
-	if !os.IsExist(err) {
+	if err != nil || !os.IsExist(err) {
 		return create_save_file(session, file_total_size, file_segment_size)
 	}
 
@@ -130,10 +162,15 @@ func create_save_file(session *DownloadSession, file_total_size int, file_segmen
 	info.Version = 1
 	info.TotalSize = uint32(file_total_size)
 	info.FileSegmentSize = uint32(file_segment_size)
-	// 各个分片的下载完成状态
-	info.SegmemtsDownloaded = make([]byte, file_total_size/file_segment_size+1)
 
-	fmt.Println("####################", file_total_size, file_segment_size, info)
+	// 各个分片的下载完成状态
+	segment_count := file_total_size / file_segment_size
+	if file_total_size%file_segment_size != 0 {
+		segment_count++
+	}
+
+	info.SegmemtsDownloaded = make([]byte, segment_count/8+1)
+
 	err = write_tdg_info(tdg_file, &info)
 	if err != nil {
 		return err
@@ -145,30 +182,38 @@ func create_save_file(session *DownloadSession, file_total_size int, file_segmen
 func read_tdg_info(session *DownloadSession) error {
 	_, err := session.tdg_file.Seek(0, os.SEEK_SET)
 	if err != nil {
-		return err
+		return errors.New("Seek failed")
 	}
 
 	err = binary.Read(session.tdg_file, binary.LittleEndian, &session.tdg_info.Version)
 	if err != nil {
-		return err
+		return errors.New("Read Version failed")
 	}
 
 	err = binary.Read(session.tdg_file, binary.LittleEndian, &session.tdg_info.TotalSize)
 	if err != nil {
-		return err
+		return errors.New("Read TotalSize failed")
 	}
 
 	err = binary.Read(session.tdg_file, binary.LittleEndian, &session.tdg_info.FileSegmentSize)
 	if err != nil {
-		return err
+		return errors.New("Read FileSegmentSize failed")
 	}
 
+	segment_count := session.tdg_info.TotalSize / session.tdg_info.FileSegmentSize
+	if session.tdg_info.TotalSize%session.tdg_info.FileSegmentSize != 0 {
+		segment_count++
+	}
+	byte_count := segment_count / 8
+	if segment_count%8 != 0 {
+		byte_count++
+	}
+
+	session.tdg_info.SegmemtsDownloaded = make([]byte, byte_count)
 	err = binary.Read(session.tdg_file, binary.LittleEndian, session.tdg_info.SegmemtsDownloaded)
 	if err != nil {
-		return err
+		return errors.New("Read SegmemtsDownloaded failed:" + err.Error())
 	}
-
-	fmt.Println("readed tdg is !!!!!!!!!!!!!!!!!!11", session.tdg_info)
 
 	return nil
 }
@@ -196,7 +241,6 @@ func write_tdg_info(file *os.File, info *TDGInfo) error {
 		return err
 	}
 
-	fmt.Println("@@@@@@@@@@@@@@@@@@", info)
 	err = binary.Write(file, binary.LittleEndian, info.SegmemtsDownloaded)
 	if err != nil {
 		return err
@@ -283,23 +327,20 @@ func getShangTickerTables(session *DownloadSession, segment_idx int) {
 	}
 }
 
-func update_tdg_file(session *DownloadSession, segment_idx int) error {
+func update_tdg_file(session *DownloadSession, segment_idx int) (err error) {
+	defer func() {
+		if err != nil {
+			err = errors.New("update_tdg_file:" + err.Error())
+		}
+	}()
 
-	// 处理位图
-
+	// 标记这部分下载完成
 	// 获取分段所在字节序号（从0开始）
 	which_byte := segment_idx / 8
-	fmt.Println(">>>>>>>>>>>>>>>>>>>>>>", which_byte, len(session.tdg_info.SegmemtsDownloaded))
-	byte_value := session.tdg_info.SegmemtsDownloaded[which_byte]
-
-	// 字节内偏移
-	offset := which_byte % 8
-	byte_value = byte_value | (1 << uint32(offset))
-
-	session.tdg_info.SegmemtsDownloaded[which_byte] = byte_value
+	byte_value := session.tdg_info.SetSegmentDownloaded(segment_idx)
 
 	// 固定头部 + which_byte
-	session.tdg_file.Seek(int64(9+which_byte), os.SEEK_END)
-	err := binary.Write(session.tdg_file, binary.LittleEndian, byte_value)
+	session.tdg_file.Seek(int64(9+which_byte), os.SEEK_SET)
+	err = binary.Write(session.tdg_file, binary.LittleEndian, byte_value)
 	return err
 }

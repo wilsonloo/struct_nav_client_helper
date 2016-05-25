@@ -32,6 +32,25 @@ type TDGInfo struct {
 	SegmemtsDownloaded []byte
 }
 
+func (this *TDGInfo) IsSegmentDownloaded(segment_idx int) bool {
+	byte_idx := segment_idx / 8
+	offset := uint(segment_idx % 8)
+
+	byte_value := this.SegmemtsDownloaded[byte_idx]
+	return (byte_value & (1 << offset)) != 0
+}
+
+func (this *TDGInfo) SetSegmentDownloaded(segment_idx int) byte {
+	byte_idx := segment_idx / 8
+	offset := uint(segment_idx % 8)
+
+	byte_value := this.SegmemtsDownloaded[byte_idx]
+	new_byte_value := byte_value | (1 << offset)
+	this.SegmemtsDownloaded[byte_idx] = new_byte_value
+
+	return new_byte_value
+}
+
 // 下载信息
 type DownloadSession struct {
 	// 现在文件的url
